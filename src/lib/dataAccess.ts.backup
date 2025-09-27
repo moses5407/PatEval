@@ -1,0 +1,367 @@
+import { v4 as uuidv4 } from 'uuid';
+import { isMultiUserMode, supabase, getCurrentUserProfile } from './supabase';
+import * as indexedDbApi from './db';
+
+// Dual-mode data access layer
+// Automatically chooses between IndexedDB (single-user) and Supabase (multi-user)
+
+let isMultiUser: boolean | null = null;
+let userProfile: any = null;
+
+// Initialize and determine mode
+export async function initializeDataAccess() {
+  try {
+    // First, always initialize IndexedDB for backward compatibility
+    await indexedDbApi.initDB();
+    
+    // Check if multi-user mode should be enabled
+    isMultiUser = await isMultiUserMode();
+    
+    if (isMultiUser) {
+      userProfile = await getCurrentUserProfile();
+      console.log('Running in multi-user mode with profile:', userProfile);
+    } else {
+      console.log('Running in single-user mode (IndexedDB)');
+    }
+    
+    return { isMultiUser, userProfile };
+  } catch (error) {
+    console.warn('Failed to initialize multi-user mode, falling back to single-user:', error);
+    isMultiUser = false;
+    return { isMultiUser: false, userProfile: null };
+  }
+}
+
+// Get current mode status
+export function getDataAccessMode() {
+  return { isMultiUser, userProfile };
+}
+
+// Patient operations
+export async function searchPatients(firstName: string, lastName: string, dateOfBirth: string) {
+  if (isMultiUser) {
+    try {
+      let query = supabase
+        .from('patients')
+        .select('*');
+      
+      if (firstName) {
+        query = query.ilike('first_name', `%${firstName}%`);
+      }
+      if (lastName) {
+        query = query.ilike('last_name', `%${lastName}%`);
+      }
+      if (dateOfBirth) {
+        query = query.eq('date_of_birth', dateOfBirth);
+      }
+      
+      const { data, error } = await query;
+      if (error) throw error;
+      
+      // Convert Supabase format to IndexedDB format for compatibility
+      return data?.map(patient => ({
+        id: patient.id,
+        firstName: patient.first_name,
+        lastName: patient.last_name,
+        dateOfBirth: patient.date_of_birth,
+        // Include multi-user fields
+        clinicId: patient.clinic_id,
+        primaryTherapistId: patient.primary_therapist_id,
+        createdBy: patient.created_by
+      })) || [];
+    } catch (error) {
+      console.error('Multi-user patient search failed:', error);
+      throw error;
+    }
+  } else {
+    return indexedDbApi.searchPatients(firstName, lastName, dateOfBirth);
+  }
+}
+
+export async function getPatientEvaluations(patientId: string) {
+  if (isMultiUser) {
+    try {
+      // First get the evaluations with patient data
+      const { data: evaluations, error: evalError } = await supabase
+        .from('evaluations')
+        .select(`
+          *,
+          patients!inner(
+            id,
+            first_name,
+            last_name,
+            date_of_birth,
+            phone,
+            email,
+            address,
+            emergency_contact_name,
+            emergency_contact_phone,
+            emergency_contact_relationship,
+            employer_name,
+            employer_address,
+            employer_phone
+          )
+        `)
+        .eq('patient_id', patientId)
+        .order('evaluation_date', { ascending: false });
+      
+      if (evalError) throw evalError;
+      if (!evaluations || evaluations.length === 0) return [];
+
+      // For each evaluation, fetch all related data
+      const completeEvaluations = await Promise.all(
+        evaluations.map(async (evaluation) => {
+          const evalId = evaluation.id;
+          
+          // Fetch selected parts/problems
+          const { data: selectedParts } = await supabase
+            .from('evaluation_selected_parts_new')
+            .select(`
+              *,
+              body_parts_new(
+                id,
+                name,
+                description,
+                body_region_id
+              )
+            `)
+            .eq('evaluation_id', evalId);
+
+          // Fetch timeline events
+          const { data: timelineEvents } = await supabase
+            .from('timeline_events')
+            .select('*')
+            .eq('evaluation_id', evalId)
+            .order('event_date', { ascending: true });
+
+          // Fetch observations
+          const { data: observations } = await supabase
+            .from('observations')
+            .select('*')
+            .eq('evaluation_id', evalId);
+
+          // Fetch ROM measurements
+          const { data: romMeasurements } = await supabase
+            .from('rom_measurements')
+            .select('*')
+            .eq('evaluation_id', evalId);
+
+          // Fetch strength measurements
+          const { data: strengthMeasurements } = await supabase
+            .from('strength_measurements')
+            .select('*')
+            .eq('evaluation_id', evalId);
+
+          // Fetch special test results
+          const { data: specialTests } = await supabase
+            .from('special_test_results')
+            .select('*')
+            .eq('evaluation_id', evalId);
+
+          // Reconstruct the complete evaluation object in the format the frontend expects
+          const patient = evaluation.patients;
+          
+          return {
+            id: evaluation.id,
+            patientId: evaluation.patient_id,
+            evaluationDate: evaluation.evaluation_date,
+            status: evaluation.status || 'draft',
+            
+            // Patient demographics
+            demographics: {
+              firstName: patient.first_name,
+              lastName: patient.last_name,
+              dateOfBirth: patient.date_of_birth,
+              phone: patient.phone,
+              email: patient.email,
+              address: patient.address
+            },
+            
+            // Emergency contact
+            emergencyContact: {
+              name: patient.emergency_contact_name,
+              phone: patient.emergency_contact_phone,
+              relationship: patient.emergency_contact_relationship
+            },
+            
+            // Employer information
+            employer: {
+              name: patient.employer_name,
+              address: patient.employer_address,
+              phone: patient.employer_phone
+            },
+            
+            // Employment status
+            employmentStatus: evaluation.employment_status,
+            
+            // Selected body parts/problems
+            selectedParts: selectedParts?.map(part => ({
+              id: part.body_part_id,
+              name: part.body_parts_new?.name || part.problem_description,
+              description: part.problem_description,
+              anatomicalSide: part.anatomical_side,
+              notes: part.notes
+            })) || [],
+            
+            // Timeline
+            timeline: timelineEvents?.map(event => ({
+              date: event.event_date,
+              type: event.event_type,
+              description: event.description,
+              details: event.details
+            })) || [],
+            
+            // Observations
+            observations: observations?.reduce((acc, obs) => {
+              acc[obs.observation_type] = obs.observation_value;
+              return acc;
+            }, {} as Record<string, any>) || {},
+            
+            // Measurements
+            measurements: {
+              rom: romMeasurements?.reduce((acc, rom) => {
+                if (!acc[rom.body_part]) acc[rom.body_part] = {};
+                acc[rom.body_part][rom.movement] = {
+                  left: rom.left_side_degrees,
+                  right: rom.right_side_degrees,
+                  notes: rom.notes
+                };
+                return acc;
+              }, {} as Record<string, any>) || {},
+              
+              strength: strengthMeasurements?.reduce((acc, strength) => {
+                if (!acc[strength.body_part]) acc[strength.body_part] = {};
+                acc[strength.body_part][strength.test_type] = {
+                  left: strength.left_side_result,
+                  right: strength.right_side_result,
+                  notes: strength.notes
+                };
+                return acc;
+              }, {} as Record<string, any>) || {},
+              
+              specialTests: specialTests?.reduce((acc, test) => {
+                acc[test.test_name] = {
+                  result: test.result,
+                  notes: test.notes,
+                  bodyPart: test.body_part
+                };
+                return acc;
+              }, {} as Record<string, any>) || {}
+            },
+            
+            // Multi-user fields
+            clinicId: evaluation.clinic_id,
+            createdBy: evaluation.created_by,
+            lastModifiedBy: evaluation.last_modified_by,
+            createdAt: evaluation.created_at,
+            updatedAt: evaluation.updated_at
+          };
+        })
+      );
+
+      return completeEvaluations;
+    } catch (error) {
+      console.error('Multi-user evaluations fetch failed:', error);
+      throw error;
+    }
+  } else {
+    return indexedDbApi.getPatientEvaluations(patientId);
+  }
+}
+
+export async function saveFormData(data: any, existingPatientId: string | null) {
+  if (isMultiUser) {
+    try {
+      let patientId = existingPatientId;
+      
+      // Create or update patient
+      if (!patientId) {
+        patientId = uuidv4();
+        const { error: patientError } = await supabase
+          .from('patients')
+          .insert({
+            id: patientId,
+            first_name: data.demographics.firstName,
+            last_name: data.demographics.lastName,
+            date_of_birth: data.demographics.dateOfBirth,
+            clinic_id: userProfile?.clinic_id,
+            primary_therapist_id: userProfile?.profile_id,
+            created_by: userProfile?.profile_id
+          });
+        
+        if (patientError) throw patientError;
+      }
+      
+      // Save evaluation
+      const evalId = data.id || uuidv4();
+      const { error: evalError } = await supabase
+        .from('evaluations')
+        .upsert({
+          id: evalId,
+          patient_id: patientId,
+          evaluation_date: data.evaluationDate,
+          evaluation_data: {
+            demographics: data.demographics,
+            employmentStatus: data.employmentStatus,
+            employer: data.employer,
+            emergencyContact: data.emergencyContact,
+            observations: data.observations,
+            functionalTesting: data.functionalTesting,
+            // ... include all other evaluation data
+          },
+          clinic_id: userProfile?.clinic_id,
+          created_by: userProfile?.profile_id,
+          last_modified_by: userProfile?.profile_id
+        });
+      
+      if (evalError) throw evalError;
+      
+      return { patientId, evaluationId: evalId };
+    } catch (error) {
+      console.error('Multi-user save failed:', error);
+      throw error;
+    }
+  } else {
+    return indexedDbApi.saveFormData(data, existingPatientId);
+  }
+}
+
+// Database management
+export async function clearDatabase() {
+  if (isMultiUser) {
+    // In multi-user mode, we don't clear the entire database
+    // Instead, we could clear user-specific data if needed
+    console.warn('Clear database not supported in multi-user mode');
+    return;
+  } else {
+    return indexedDbApi.clearDatabase();
+  }
+}
+
+export async function isDatabaseEmpty() {
+  if (isMultiUser) {
+    try {
+      const { count, error } = await supabase
+        .from('patients')
+        .select('*', { count: 'exact', head: true });
+      
+      if (error) throw error;
+      return count === 0;
+    } catch (error) {
+      console.error('Failed to check database status:', error);
+      return false;
+    }
+  } else {
+    return indexedDbApi.isDatabaseEmpty();
+  }
+}
+
+export async function addTestPatient(patientData: any) {
+  if (isMultiUser) {
+    // In multi-user mode, we don't auto-add test data
+    console.log('Test data not added in multi-user mode');
+    return;
+  } else {
+    return indexedDbApi.addTestPatient(patientData);
+  }
+}
